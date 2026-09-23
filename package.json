@@ -1,6 +1,6 @@
 {
   "name": "raghav-anime-stremio-addon",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "A standard Stremio-compatible Raghav Anime stream addon for Stremio and Nuvio",

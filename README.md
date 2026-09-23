@@ -1,6 +1,6 @@
 # Raghav Anime — Stremio and Nuvio addon
 
-This is a standard Stremio-compatible HTTP addon. It does not require CloudStream, a `.cs3` loader, or CNCVerse Bridge on the user's device.
+This is a standard Stremio-compatible HTTP addon. It does not require CloudStream, a `.cs3` loader, or CNCVerse Bridge on the user's device. Playback links are served through the addon so required provider headers reach HLS playlists and video segments.
 
 ## Run locally
 
@@ -18,7 +18,7 @@ The repository includes a `Dockerfile` and `render.yaml`. Deploy it to any Docke
 https://YOUR-HOST/manifest.json
 ```
 
-The same manifest works in Stremio and Nuvio.
+The same manifest works in Stremio and Nuvio. It accepts IMDb, Kitsu, AniList, MAL, and TMDB episode IDs and handles the `anime` content type used by anime catalogs.
 
 ## Implemented aggregate sources
 

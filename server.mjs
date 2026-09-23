@@ -2,15 +2,19 @@
 
 import http from "node:http";
 
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+
+import { Readable } from "node:stream";
+
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.0.0",
+  version: "1.1.0",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
   resources: ["stream"],
-  types: ["movie", "series"],
-  idPrefixes: ["tt"],
+  types: ["movie", "series", "anime"],
+  idPrefixes: ["tt", "kitsu:", "anilist:", "mal:", "tmdb:"],
   catalogs: [],
   behaviorHints: {
     configurable: false,
@@ -169,6 +173,8 @@ function candidateScore(media, title, year, season, queryIndex, resultIndex) {
 }
 
 async function resolveMedia(type, rawId) {
+  const alternate = await resolveAlternateId(type, rawId);
+  if (alternate) return alternate;
   const parsed = parseStremioId(type, rawId);
   if (!parsed) return null;
   const key = `mapping:${type}:${rawId}`;
@@ -206,6 +212,64 @@ async function resolveMedia(type, rawId) {
     episode: parsed.episode,
     year: best.media.seasonYear || year
   });
+}
+
+async function resolveAlternateId(type, rawId) {
+  const parts = decodeURIComponent(rawId).split(":");
+  const prefix = parts[0];
+  if (!["kitsu", "anilist", "mal", "tmdb"].includes(prefix) || !/^\d+$/.test(parts[1] || "")) return null;
+  const key = `alternate:${type}:${rawId}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+  let episode;
+  let season = 1;
+  if (prefix === "tmdb") {
+    season = type === "movie" ? 1 : Number(parts[2]);
+    episode = type === "movie" ? 1 : Number(parts[3]);
+  } else {
+    episode = type === "movie" && parts[2] == null ? 1 : Number(parts[2]);
+  }
+  if (!Number.isInteger(episode) || episode < 1 || !Number.isInteger(season) || season < 0) return null;
+
+  let aniListId;
+  let title;
+  let year;
+  if (prefix === "anilist") {
+    aniListId = Number(parts[1]);
+  } else if (prefix === "mal") {
+    const query = `query ($id: Int!) { Media(idMal: $id, type: ANIME) { id title { english romaji } seasonYear } }`;
+    const response = await fetchJson("https://graphql.anilist.co", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query, variables: { id: Number(parts[1]) } })
+    });
+    aniListId = response.data?.Media?.id;
+    title = response.data?.Media?.title?.english || response.data?.Media?.title?.romaji;
+    year = response.data?.Media?.seasonYear;
+  } else if (prefix === "kitsu") {
+    const response = await fetchJson(`https://kitsu.io/api/edge/anime/${parts[1]}`);
+    const attributes = response.data?.attributes;
+    title = attributes?.titles?.en || attributes?.canonicalTitle;
+    year = Number(attributes?.startDate?.slice(0, 4)) || null;
+  } else {
+    const apiKey = process.env.TMDB_API_KEY || "e6333b32409e02a4a6eba6fb7ff866bb";
+    const kind = type === "movie" ? "movie" : "tv";
+    const response = await fetchJson(`https://api.themoviedb.org/3/${kind}/${parts[1]}?api_key=${apiKey}&language=en-US`);
+    title = response.name || response.title;
+    year = Number((response.first_air_date || response.release_date || "").slice(0, 4)) || null;
+    if (type !== "movie" && season > 1) {
+      const seasonData = await fetchJson(`https://api.themoviedb.org/3/tv/${parts[1]}/season/${season}?api_key=${apiKey}&language=en-US`);
+      if (seasonData.name && !/^season\s+\d+$/i.test(seasonData.name)) title = seasonData.name;
+      year = Number((seasonData.air_date || "").slice(0, 4)) || year;
+    }
+  }
+  if (!aniListId && title) {
+    const results = await aniListSearch(title);
+    results.sort((a, b) => candidateScore(b, title, year, season, 0, 0) - candidateScore(a, title, year, season, 0, 0));
+    if (!results[0] || candidateScore(results[0], title, year, season, 0, 0) < 65) return null;
+    aniListId = results[0].id;
+  }
+  if (!aniListId) return null;
+  return cacheSet(key, { aniListId, episode, season, title: title || "Anime", year });
 }
 
 
@@ -372,6 +436,125 @@ async function getStreams(type, id) {
 
 
 
+const secret = process.env.PROXY_SECRET || randomBytes(32).toString("hex");
+const lifetimeMs = 6 * 60 * 60 * 1000;
+
+function publicBase(request) {
+  const proto = request.headers["x-forwarded-proto"]?.split(",")[0] || "http";
+  const host = request.headers["x-forwarded-host"]?.split(",")[0] || request.headers.host;
+  return process.env.PUBLIC_URL || `${proto}://${host}`;
+}
+
+function sign(value) {
+  return createHmac("sha256", secret).update(value).digest("base64url");
+}
+
+function filenameFor(url, kind) {
+  if (kind === "subtitle") return "subtitle.vtt";
+  const path = new URL(url).pathname.toLowerCase();
+  if (/\.mp4$/.test(path)) return "video.mp4";
+  if (kind === "stream" || /\.m3u8$/.test(path) || /\/m3u8$/.test(path)) return "master.m3u8";
+  if (/\.vtt$/.test(path)) return "subtitle.vtt";
+  if (/\.m4s$/.test(path)) return "segment.m4s";
+  if (/\.key$/.test(path)) return "key.bin";
+  return "segment.ts";
+}
+
+function proxyUrl(request, url, headers = {}, expires = Date.now() + lifetimeMs, kind) {
+  const target = new URL(url);
+  if (!["http:", "https:"].includes(target.protocol)) throw new Error("Unsupported stream URL");
+  const payload = Buffer.from(JSON.stringify({ url: target.href, headers, expires })).toString("base64url");
+  return `${publicBase(request).replace(/\/$/, "")}/play/${payload}.${sign(payload)}/${filenameFor(target.href, kind)}`;
+}
+
+function decode(token) {
+  const dot = token.lastIndexOf(".");
+  if (dot < 1) return null;
+  const payload = token.slice(0, dot);
+  const signature = Buffer.from(token.slice(dot + 1));
+  const expected = Buffer.from(sign(payload));
+  if (signature.length !== expected.length || !timingSafeEqual(signature, expected)) return null;
+  try {
+    const value = JSON.parse(Buffer.from(payload, "base64url").toString());
+    if (Date.now() > value.expires || !["http:", "https:"].includes(new URL(value.url).protocol)) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function rewritePlaylist(body, upstreamUrl, request, headers, expires) {
+  const wrap = (path) => proxyUrl(request, new URL(path, upstreamUrl).href, headers, expires);
+  return body.split(/\r?\n/).map((line) => {
+    if (line.startsWith("#")) {
+      return line.replace(/URI="([^"]+)"/g, (_, path) => `URI="${wrap(path)}"`);
+    }
+    return line.trim() ? wrap(line.trim()) : line;
+  }).join("\n");
+}
+
+async function handleProxyRequest(request, response, token) {
+  const item = decode(token);
+  if (!item) {
+    response.writeHead(403);
+    return response.end("Invalid or expired playback link");
+  }
+  try {
+    const headers = { ...item.headers };
+    if (request.headers.range) headers.range = request.headers.range;
+    const upstream = await fetchWithTimeout(item.url, { headers }, 25000);
+    if (!upstream.ok && upstream.status !== 206) {
+      response.writeHead(upstream.status);
+      return response.end("Upstream playback failed");
+    }
+    let type = upstream.headers.get("content-type") || "application/octet-stream";
+    const playlist = /mpegurl|m3u8/i.test(type) || /\.m3u8$/i.test(new URL(upstream.url).pathname);
+    if (playlist) {
+      const body = rewritePlaylist(await upstream.text(), upstream.url, request, item.headers, item.expires);
+      response.writeHead(200, {
+        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "access-control-allow-origin": "*",
+        "cache-control": "no-store"
+      });
+      return response.end(body);
+    }
+    if (type.startsWith("image/jpeg") && /\/seg-[^/]+\.jpg$/i.test(new URL(upstream.url).pathname)) type = "video/mp2t";
+    const forwarded = { "content-type": type, "access-control-allow-origin": "*", "accept-ranges": "bytes" };
+    for (const key of ["content-length", "content-range", "etag", "last-modified"]) {
+      const value = upstream.headers.get(key);
+      if (value) forwarded[key] = value;
+    }
+    response.writeHead(upstream.status, forwarded);
+    if (upstream.body) Readable.fromWeb(upstream.body).on("error", () => response.destroy()).pipe(response);
+    else response.end();
+  } catch (error) {
+    console.error("playback proxy failed", error);
+    if (!response.headersSent) response.writeHead(502);
+    response.end("Playback source unavailable");
+  }
+}
+
+function prepareStreams(request, streams) {
+  return streams.map((stream) => {
+    const headers = stream.behaviorHints?.proxyHeaders?.request || {};
+    try {
+      return {
+        ...stream,
+        url: proxyUrl(request, stream.url, headers, undefined, "stream"),
+        subtitles: stream.subtitles?.map((subtitle) => ({
+          ...subtitle,
+          url: proxyUrl(request, subtitle.url, headers, undefined, "subtitle")
+        })),
+        behaviorHints: { ...stream.behaviorHints, notWebReady: false, proxyHeaders: undefined }
+      };
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+
+
 const port = Number(process.env.PORT || 7000);
 
 function json(response, status, body) {
@@ -389,11 +572,13 @@ const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   if (url.pathname === "/manifest.json") return json(response, 200, manifest);
   if (url.pathname === "/health") return json(response, 200, { ok: true });
+  const playback = url.pathname.match(/^\/play\/([^/]+)\/[^/]+$/);
+  if (playback) return handleProxyRequest(request, response, playback[1]);
 
-  const match = url.pathname.match(/^\/stream\/(movie|series)\/(.+)\.json$/);
+  const match = url.pathname.match(/^\/stream\/(movie|series|anime)\/(.+)\.json$/);
   if (match) {
     try {
-      return json(response, 200, { streams: await getStreams(match[1], match[2]) });
+      return json(response, 200, { streams: prepareStreams(request, await getStreams(match[1], match[2])) });
     } catch (error) {
       console.error("stream request failed", error);
       return json(response, 200, { streams: [] });
