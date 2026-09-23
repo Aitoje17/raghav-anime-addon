@@ -8,7 +8,7 @@ import { Readable } from "node:stream";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.0",
+  version: "1.3.1",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -958,7 +958,7 @@ const server = http.createServer(async (request, response) => {
     }
   }
 
-  const subtitleMatch = url.pathname.match(/^\/subtitles\/(movie|series|anime)\/(.+)\.json$/);
+  const subtitleMatch = url.pathname.match(/^\/subtitles\/(movie|series|anime)\/([^/]+)(?:\/[^/]+)?\.json$/);
   if (subtitleMatch) {
     try {
       return json(response, 200, { subtitles: prepareSubtitles(request, await getStreams(subtitleMatch[1], subtitleMatch[2])) }, false);
