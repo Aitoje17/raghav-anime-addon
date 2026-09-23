@@ -2,13 +2,15 @@
 
 import http from "node:http";
 
+import https from "node:https";
+
 import { createHmac, randomBytes, timingSafeEqual, createHash, createDecipheriv, pbkdf2Sync } from "node:crypto";
 
 import { Readable } from "node:stream";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.1",
+  version: "1.3.2",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -426,6 +428,36 @@ const BASE = "https://reanime.to";
 const FLIX = "https://flixcloud.cc";
 const USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
 
+function nativeJson(url, headers) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { headers: { ...headers, "accept-encoding": "identity" } }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("error", reject);
+      response.on("end", () => {
+        const body = Buffer.concat(chunks).toString();
+        if (response.statusCode !== 200) {
+          return reject(new Error(`HTTPS ${response.statusCode} from reanime.to (${response.headers.server || "unknown server"}; ${response.headers["cf-mitigated"] || "no challenge header"}; ${body.slice(0, 80).replace(/\s+/g, " ")})`));
+        }
+        try { resolve(JSON.parse(body)); } catch (error) { reject(error); }
+      });
+    });
+    request.setTimeout(15000, () => request.destroy(new Error("ReAnime HTTPS timeout")));
+    request.on("error", reject);
+  });
+}
+
+async function reanimeJson(url, headers) {
+  const response = await fetchWithTimeout(url, { headers });
+  if (response.ok) return response.json();
+  if (response.status !== 403) throw new Error(`${response.status} from reanime.to`);
+  try {
+    return await nativeJson(url, headers);
+  } catch (error) {
+    throw new Error(`ReAnime fetch 403; ${error.message}`);
+  }
+}
+
 function sha(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -572,8 +604,8 @@ async function resolveEmbed(embedUrl) {
 }
 
 return async function getReAnimeStreams(media) {
-  const result = await fetchJson(`${BASE}/api/flix/${media.aniListId}/${media.episode}`, {
-    headers: { "user-agent": USER_AGENT, accept: "application/json", referer: `${BASE}/watch/` }
+  const result = await reanimeJson(`${BASE}/api/flix/${media.aniListId}/${media.episode}`, {
+    "user-agent": USER_AGENT, accept: "application/json", referer: `${BASE}/watch/`
   });
   const servers = [...new Map((result.servers || [])
     .filter((item) => item.dataLink?.startsWith("http"))
