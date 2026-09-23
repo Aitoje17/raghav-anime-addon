@@ -2,13 +2,13 @@
 
 import http from "node:http";
 
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual, createHash, createDecipheriv, pbkdf2Sync } from "node:crypto";
 
 import { Readable } from "node:stream";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.1.0",
+  version: "1.2.0",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -422,8 +422,164 @@ return async function getAniChanStreams(media) {
 
 })();
 
+const getReAnimeStreams = (() => {
 
-const providers = [getAniNamiStreams, getAniChanStreams];
+const BASE = "https://reanime.to";
+const FLIX = "https://flixcloud.cc";
+const USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+
+function sha(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function shaChain(seed) {
+  let value = seed;
+  for (let index = 0; index < 3; index++) value = sha(value + index);
+  return value;
+}
+
+function field(source, key) {
+  return source.match(new RegExp(`"?${key}"?\\s*:\\s*"([^"]+)"`))?.[1] || null;
+}
+
+function dataBytes(wasm) {
+  function leb(index) {
+    let value = 0;
+    let shift = 0;
+    while (index < wasm.length) {
+      const byte = wasm[index++];
+      value |= (byte & 0x7f) << shift;
+      if (!(byte & 0x80)) break;
+      shift += 7;
+    }
+    return [value, index];
+  }
+  let index = 8;
+  let largest = Buffer.alloc(0);
+  while (index < wasm.length) {
+    const section = wasm[index++];
+    const [size, start] = leb(index);
+    const end = start + size;
+    if (section === 11) {
+      let cursor = start;
+      const [count, afterCount] = leb(cursor);
+      cursor = afterCount;
+      for (let item = 0; item < count; item++) {
+        cursor++; // active segment flag
+        if (wasm[cursor++] !== 0x41) return null;
+        [, cursor] = leb(cursor); // offset
+        if (wasm[cursor++] !== 0x0b) return null;
+        const [length, afterLength] = leb(cursor);
+        cursor = afterLength;
+        if (length > largest.length) largest = wasm.subarray(cursor, cursor + length);
+        cursor += length;
+      }
+    }
+    index = end;
+  }
+  return largest.length >= 64 ? largest : null;
+}
+
+function decryptPlaylist(body, key) {
+  const trimmed = body.trim();
+  if (trimmed.startsWith("#EXTM3U")) return trimmed;
+  const raw = Buffer.from(trimmed, "base64");
+  const plain = Buffer.alloc(raw.length);
+  for (let i = 0; i < raw.length; i++) plain[i] = raw[i] ^ key[i % key.length];
+  const text = plain.toString();
+  return text.startsWith("#EXTM3U") ? text : null;
+}
+
+async function resolveEmbed(embedUrl) {
+  const pageHeaders = { "user-agent": USER_AGENT, referer: `${BASE}/` };
+  const pageResponse = await fetchWithTimeout(embedUrl, { headers: pageHeaders });
+  if (!pageResponse.ok) return null;
+  const region = (await pageResponse.text()).split("node_ids")[1];
+  if (!region) return null;
+  const seed = field(region, "obfuscation_seed");
+  const payload = field(region, "w_payload");
+  if (!seed || !payload) return null;
+  const first = shaChain(seed);
+  const second = shaChain(first);
+  const keyFragment = field(region, `kf_${first.slice(8, 16)}`);
+  const iv = field(region, `ivf_${first.slice(16, 24)}`);
+  const token = field(region, `${first.slice(48, 64)}_${first.slice(56, 64)}`);
+  const keyFragment2 = field(region, `${second.slice(0, 16)}_${second.slice(16, 24)}`);
+  if (!keyFragment || !iv || !token || !keyFragment2) return null;
+
+  const tokenResponse = await fetchWithTimeout(`${FLIX}/api/m3u8/${token}`, { headers: pageHeaders });
+  if (!tokenResponse.ok) return null;
+  const tokenBody = await tokenResponse.text();
+  const encryptedVideo = field(tokenBody, sha(token + "vid").slice(0, 10));
+  const encryptedKey = field(tokenBody, sha(token + "key").slice(0, 10));
+  if (!encryptedVideo || !encryptedKey) return null;
+
+  const wasm = Buffer.from(payload, "base64");
+  const { instance } = await WebAssembly.instantiate(wasm);
+  const fragment1 = Buffer.from(keyFragment, "base64");
+  const fragment2 = Buffer.from(keyFragment2, "base64");
+  const encryptedKeyBytes = Buffer.from(encryptedKey, "base64");
+  const length = fragment1.length;
+  if (!length || fragment2.length !== length || encryptedKeyBytes.length !== length) return null;
+  const memory = new Uint8Array(instance.exports.memory.buffer);
+  const base = 1000;
+  memory.set(fragment1, base);
+  memory.set(fragment2, base + length);
+  memory.set(encryptedKeyBytes, base + 2 * length);
+  instance.exports._s(parseInt(seed.slice(0, 8), 16) | 0);
+  instance.exports._r(base, base + length, base + 2 * length, base + 3 * length, length);
+  const keySeed = Buffer.from(memory.slice(base + 3 * length, base + 4 * length));
+  if (keySeed.every((byte) => byte === 0)) return null;
+
+  const seedBytes = Buffer.from(seed);
+  const derived = pbkdf2Sync(keySeed, seedBytes, 1000, 32, "sha256");
+  for (let i = 0; i < derived.length; i++) derived[i] ^= seedBytes[i % seedBytes.length];
+  const aesKey = createHash("sha256").update(derived).digest();
+  const decipher = createDecipheriv("aes-256-cbc", aesKey, Buffer.from(iv, "base64"));
+  decipher.setAutoPadding(false);
+  const decrypted = Buffer.concat([decipher.update(Buffer.from(encryptedVideo, "base64")), decipher.final()]);
+  const padding = decrypted.at(-1);
+  const masterUrl = decrypted.subarray(0, padding >= 1 && padding <= 16 ? -padding : undefined).toString().trim();
+  if (!masterUrl.startsWith("http")) return null;
+  const keyData = dataBytes(wasm);
+  if (!keyData) return null;
+  const playlistKey = Buffer.alloc(32);
+  for (let i = 0; i < 32; i++) playlistKey[i] = keyData[i] ^ keyData[i + 32];
+  const masterResponse = await fetchWithTimeout(masterUrl, { headers: { "user-agent": USER_AGENT, referer: `${FLIX}/` } });
+  if (!masterResponse.ok) return null;
+  const master = decryptPlaylist(await masterResponse.text(), playlistKey);
+  if (!master) return null;
+  return { url: masterUrl, key: playlistKey.toString("base64"), master };
+}
+
+return async function getReAnimeStreams(media) {
+  const result = await fetchJson(`${BASE}/api/flix/${media.aniListId}/${media.episode}`, {
+    headers: { "user-agent": USER_AGENT, accept: "application/json", referer: `${BASE}/watch/` }
+  });
+  if (!result.success) return [];
+  const servers = [...new Map((result.servers || [])
+    .filter((item) => item.dataLink?.startsWith("http"))
+    .map((item) => [item.dataLink, item])).values()];
+  const resolved = await settleWithConcurrency(servers.map((server) => async () => ({
+    server, playback: await resolveEmbed(server.dataLink)
+  })), 3);
+  return resolved.filter((item) => item?.playback).map(({ server, playback }) => ({
+    name: "Raghav Anime\nReAnime",
+    title: `ReAnime • ${server.serverName || "HD"} • Multi-Audio`,
+    url: playback.url,
+    flixKey: playback.key,
+    behaviorHints: {
+      bingeGroup: "raghav-reanime",
+      notWebReady: false,
+      proxyHeaders: { request: { Referer: `${FLIX}/`, "User-Agent": USER_AGENT } }
+    }
+  }));
+}
+
+})();
+
+
+const providers = [getAniNamiStreams, getAniChanStreams, getReAnimeStreams];
 
 async function getStreams(type, id) {
   const media = await resolveMedia(type, id);
@@ -456,15 +612,16 @@ function filenameFor(url, kind) {
   if (kind === "stream" || /\.m3u8$/.test(path) || /\/m3u8$/.test(path)) return "master.m3u8";
   if (/\.vtt$/.test(path)) return "subtitle.vtt";
   if (/\.m4s$/.test(path)) return "segment.m4s";
-  if (/\.key$/.test(path)) return "key.bin";
+  if (/\.(?:key|bin)$/.test(path)) return "key.bin";
   return "segment.ts";
 }
 
-function proxyUrl(request, url, headers = {}, expires = Date.now() + lifetimeMs, kind) {
+function proxyUrl(request, url, headers = {}, expires = Date.now() + lifetimeMs, kind, flixKey) {
   const target = new URL(url);
   if (!["http:", "https:"].includes(target.protocol)) throw new Error("Unsupported stream URL");
-  const payload = Buffer.from(JSON.stringify({ url: target.href, headers, expires })).toString("base64url");
-  return `${publicBase(request).replace(/\/$/, "")}/play/${payload}.${sign(payload)}/${filenameFor(target.href, kind)}`;
+  const filename = filenameFor(target.href, kind);
+  const payload = Buffer.from(JSON.stringify({ url: target.href, headers, expires, filename, flixKey })).toString("base64url");
+  return `${publicBase(request).replace(/\/$/, "")}/play/${payload}.${sign(payload)}/${filename}`;
 }
 
 function decode(token) {
@@ -483,14 +640,65 @@ function decode(token) {
   }
 }
 
-function rewritePlaylist(body, upstreamUrl, request, headers, expires) {
-  const wrap = (path) => proxyUrl(request, new URL(path, upstreamUrl).href, headers, expires);
+function rewritePlaylist(body, upstreamUrl, request, headers, expires, flixKey) {
+  const wrap = (path) => proxyUrl(request, new URL(path, upstreamUrl).href, headers, expires, undefined, flixKey);
   return body.split(/\r?\n/).map((line) => {
     if (line.startsWith("#")) {
       return line.replace(/URI="([^"]+)"/g, (_, path) => `URI="${wrap(path)}"`);
     }
     return line.trim() ? wrap(line.trim()) : line;
   }).join("\n");
+}
+
+function decryptFlixPlaylist(body, encodedKey) {
+  const trimmed = body.trim();
+  if (trimmed.startsWith("#EXTM3U")) return trimmed;
+  const key = Buffer.from(encodedKey, "base64");
+  if (key.length !== 32) return null;
+  const raw = Buffer.from(trimmed, "base64");
+  const plain = Buffer.alloc(raw.length);
+  for (let index = 0; index < raw.length; index++) plain[index] = raw[index] ^ key[index % key.length];
+  const text = plain.toString();
+  return text.startsWith("#EXTM3U") ? text : null;
+}
+
+function decodeFlixSegment(raw) {
+  let header = 0;
+  if (raw.subarray(0, 4).toString() === "RIFF" && raw.subarray(8, 12).toString() === "WEBP") header = 12;
+  else if (raw.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) header = 8;
+  const data = Buffer.from(raw.subarray(header));
+  if (header && data[0] !== 0x47) {
+    const xor = Buffer.from([157, 42, 241, 71, 179, 142, 92, 112, 166, 25, 228, 59, 216, 98, 15, 197]);
+    for (let index = 0; index < data.length; index++) data[index] ^= xor[index & 15];
+  }
+  return data;
+}
+
+function sendMediaBytes(request, response, bytes, type) {
+  const common = {
+    "content-type": type,
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
+    "accept-ranges": "bytes"
+  };
+  const range = request.headers.range?.match(/^bytes=(\d*)-(\d*)$/);
+  if (range) {
+    const start = range[1] ? Number(range[1]) : Math.max(0, bytes.length - Number(range[2]));
+    const end = range[2] && range[1] ? Math.min(Number(range[2]), bytes.length - 1) : bytes.length - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= bytes.length) {
+      response.writeHead(416, { ...common, "content-range": `bytes */${bytes.length}` });
+      return response.end();
+    }
+    response.writeHead(206, {
+      ...common,
+      "content-length": end - start + 1,
+      "content-range": `bytes ${start}-${end}/${bytes.length}`
+    });
+    return response.end(bytes.subarray(start, end + 1));
+  }
+  response.writeHead(200, { ...common, "content-length": bytes.length });
+  return response.end(bytes);
 }
 
 async function handleProxyRequest(request, response, token) {
@@ -501,25 +709,50 @@ async function handleProxyRequest(request, response, token) {
   }
   try {
     const headers = { ...item.headers };
-    if (request.headers.range) headers.range = request.headers.range;
+    if (request.headers.range && !item.flixKey && !/^(?:segment\.ts|segment\.m4s)$/.test(item.filename)) headers.range = request.headers.range;
     const upstream = await fetchWithTimeout(item.url, { headers }, 25000);
     if (!upstream.ok && upstream.status !== 206) {
       response.writeHead(upstream.status);
       return response.end("Upstream playback failed");
     }
     let type = upstream.headers.get("content-type") || "application/octet-stream";
-    const playlist = /mpegurl|m3u8/i.test(type) || /\.m3u8$/i.test(new URL(upstream.url).pathname);
+    const playlist = /mpegurl|m3u8/i.test(type) || /\.m3u8$/i.test(new URL(upstream.url).pathname) || item.filename?.endsWith(".m3u8");
     if (playlist) {
-      const body = rewritePlaylist(await upstream.text(), upstream.url, request, item.headers, item.expires);
+      const raw = await upstream.text();
+      const plain = item.flixKey ? decryptFlixPlaylist(raw, item.flixKey) : raw;
+      if (!plain?.startsWith("#EXTM3U")) {
+        response.writeHead(502, { "access-control-allow-origin": "*" });
+        return response.end("Invalid upstream playlist");
+      }
+      const body = rewritePlaylist(plain, upstream.url, request, item.headers, item.expires, item.flixKey);
       response.writeHead(200, {
         "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "content-length": Buffer.byteLength(body),
         "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, HEAD, OPTIONS",
         "cache-control": "no-store"
       });
       return response.end(body);
     }
+    if (item.flixKey) {
+      if (item.filename === "key.bin") {
+        const key = Buffer.from(await upstream.arrayBuffer());
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "content-length": key.length,
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, HEAD, OPTIONS"
+        });
+        return response.end(key);
+      }
+      const decoded = decodeFlixSegment(Buffer.from(await upstream.arrayBuffer()));
+      return sendMediaBytes(request, response, decoded, "video/mp2t");
+    }
     if (type.startsWith("image/jpeg") && /\/seg-[^/]+\.jpg$/i.test(new URL(upstream.url).pathname)) type = "video/mp2t";
-    const forwarded = { "content-type": type, "access-control-allow-origin": "*", "accept-ranges": "bytes" };
+    if (/^(?:segment\.ts|segment\.m4s)$/.test(item.filename)) {
+      return sendMediaBytes(request, response, Buffer.from(await upstream.arrayBuffer()), type);
+    }
+    const forwarded = { "content-type": type, "access-control-allow-origin": "*", "access-control-allow-methods": "GET, HEAD, OPTIONS", "accept-ranges": "bytes" };
     for (const key of ["content-length", "content-range", "etag", "last-modified"]) {
       const value = upstream.headers.get(key);
       if (value) forwarded[key] = value;
@@ -536,11 +769,12 @@ async function handleProxyRequest(request, response, token) {
 
 function prepareStreams(request, streams) {
   return streams.map((stream) => {
+    const { flixKey, ...publicStream } = stream;
     const headers = stream.behaviorHints?.proxyHeaders?.request || {};
     try {
       return {
-        ...stream,
-        url: proxyUrl(request, stream.url, headers, undefined, "stream"),
+        ...publicStream,
+        url: proxyUrl(request, stream.url, headers, undefined, "stream", flixKey),
         subtitles: stream.subtitles?.map((subtitle) => ({
           ...subtitle,
           url: proxyUrl(request, subtitle.url, headers, undefined, "subtitle")
@@ -557,12 +791,13 @@ function prepareStreams(request, streams) {
 
 const port = Number(process.env.PORT || 7000);
 
-function json(response, status, body) {
+function json(response, status, body, cache = true) {
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "*",
-    "cache-control": status === 200 ? "public, max-age=300" : "no-store"
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    "cache-control": status === 200 && cache ? "public, max-age=300" : "no-store"
   });
   response.end(JSON.stringify(body));
 }
@@ -578,10 +813,10 @@ const server = http.createServer(async (request, response) => {
   const match = url.pathname.match(/^\/stream\/(movie|series|anime)\/(.+)\.json$/);
   if (match) {
     try {
-      return json(response, 200, { streams: prepareStreams(request, await getStreams(match[1], match[2])) });
+      return json(response, 200, { streams: prepareStreams(request, await getStreams(match[1], match[2])) }, false);
     } catch (error) {
       console.error("stream request failed", error);
-      return json(response, 200, { streams: [] });
+      return json(response, 200, { streams: [] }, false);
     }
   }
 

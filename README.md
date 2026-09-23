@@ -24,5 +24,6 @@ The same manifest works in Stremio and Nuvio. It accepts IMDb, Kitsu, AniList, M
 
 - AniNami's provider aggregation (SUB and DUB, direct HLS/MP4, subtitles)
 - AniChan (SUB and DUB, including its Vidhawk resolver)
+- ReAnime (FlixCloud HLS with encrypted playlist and segment handling)
 
 Providers are fault-isolated; one upstream failure does not fail the stream response.
