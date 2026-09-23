@@ -18,12 +18,12 @@ The repository includes a `Dockerfile` and `render.yaml`. Deploy it to any Docke
 https://YOUR-HOST/manifest.json
 ```
 
-The same manifest works in Stremio and Nuvio. It accepts IMDb, Kitsu, AniList, MAL, and TMDB episode IDs and handles the `anime` content type used by anime catalogs.
+The same manifest works in Stremio and Nuvio. It accepts IMDb, Kitsu, AniList, MAL, and TMDB episode IDs and handles the `anime` content type used by anime catalogs. Source subtitles are exposed both on individual streams and through Stremio's subtitle resource. A source that supplies no subtitles cannot provide a matching subtitle track; tracks from other sources are labeled separately.
 
 ## Implemented aggregate sources
 
 - AniNami's provider aggregation (SUB and DUB, direct HLS/MP4, subtitles)
 - AniChan (SUB and DUB, including its Vidhawk resolver)
-- ReAnime (FlixCloud HLS with encrypted playlist and segment handling)
+- ReAnime (FlixCloud HLS with encrypted playlist and segment handling; source ASS subtitles converted to VTT)
 
 Providers are fault-isolated; one upstream failure does not fail the stream response.

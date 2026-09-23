@@ -8,11 +8,11 @@ import { Readable } from "node:stream";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.2.0",
+  version: "1.3.0",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
-  resources: ["stream"],
+  resources: ["stream", "subtitles"],
   types: ["movie", "series", "anime"],
   idPrefixes: ["tt", "kitsu:", "anilist:", "mal:", "tmdb:"],
   catalogs: [],
@@ -387,37 +387,35 @@ async function resolveVidhawk(media, audio, server) {
 
 return async function getAniChanStreams(media) {
   const audioResults = await settleWithConcurrency(["sub", "dub"].map((audio) => async () => ({ audio, items: await servers(media, audio) })), 2);
-  const streams = [];
-  for (const result of audioResults.filter(Boolean)) {
-    for (const server of result.items) {
+  const targets = audioResults.filter(Boolean).flatMap((result) => result.items.map((server) => ({ audio: result.audio, server })));
+  const resolved = await settleWithConcurrency(targets.map(({ audio, server }) => async () => {
       let url = server.stream;
       if (server.type === "embed") {
         const provider = String(server.embed || "").match(/[?&]server=([^&]+)/)?.[1] || "kari";
-        try { url = await resolveVidhawk(media, result.audio, provider); } catch { url = null; }
+        try { url = await resolveVidhawk(media, audio, provider); } catch { url = null; }
       } else if (url?.startsWith("/")) {
         url = `${BASE_URL}${url}`;
       }
-      if (!url?.startsWith("http")) continue;
+      if (!url?.startsWith("http")) return null;
       const label = String(server.label || server.name || "AniChan").replace("★", "").trim();
       const subtitles = (server.subtitles || []).filter((sub) => sub.url?.startsWith("http")).map((sub, index) => ({
         id: `anichan-${index}-${sub.lang || "subtitle"}`,
         url: sub.url,
         lang: String(sub.lang || "und").slice(0, 3).toLowerCase()
       }));
-      streams.push({
-        name: `Raghav Anime\nAniChan ${result.audio.toUpperCase()}`,
-        title: `${label} • ${result.audio.toUpperCase()}`,
+      return {
+        name: `Raghav Anime\nAniChan ${audio.toUpperCase()}`,
+        title: `${label} • ${audio.toUpperCase()}`,
         url,
         subtitles,
         behaviorHints: {
-          bingeGroup: `raghav-anichan-${result.audio}`,
+          bingeGroup: `raghav-anichan-${audio}`,
           notWebReady: false,
           proxyHeaders: { request: { Referer: `${BASE_URL}/`, "User-Agent": USER_AGENT } }
         }
-      });
-    }
-  }
-  return streams;
+      };
+  }), 8);
+  return resolved.filter(Boolean);
 }
 
 })();
@@ -440,6 +438,27 @@ function shaChain(seed) {
 
 function field(source, key) {
   return source.match(new RegExp(`"?${key}"?\\s*:\\s*"([^"]+)"`))?.[1] || null;
+}
+
+function subtitleLanguage(value = "") {
+  const language = value.toLowerCase();
+  if (language.startsWith("en")) return "eng";
+  if (language.startsWith("es")) return "spa";
+  if (language.startsWith("pt")) return "por";
+  if (language.startsWith("fr")) return "fra";
+  if (language.startsWith("de")) return "deu";
+  if (language.startsWith("ja")) return "jpn";
+  return language.length === 3 ? language : "und";
+}
+
+function extractSubtitles(region) {
+  const list = region.match(/subtitles:\[([^\]]*)\]/)?.[1] || "";
+  return [...list.matchAll(/\{([^{}]*)\}/g)].flatMap((match, index) => {
+    const url = field(match[1], "url");
+    if (!url?.startsWith("http")) return [];
+    const language = field(match[1], "language") || "Subtitle";
+    return [{ id: `reanime-${index}`, url, lang: subtitleLanguage(language), label: `ReAnime • ${language}` }];
+  });
 }
 
 function dataBytes(wasm) {
@@ -493,26 +512,26 @@ function decryptPlaylist(body, key) {
 async function resolveEmbed(embedUrl) {
   const pageHeaders = { "user-agent": USER_AGENT, referer: `${BASE}/` };
   const pageResponse = await fetchWithTimeout(embedUrl, { headers: pageHeaders });
-  if (!pageResponse.ok) return null;
+  if (!pageResponse.ok) throw new Error(`embed HTTP ${pageResponse.status}`);
   const region = (await pageResponse.text()).split("node_ids")[1];
-  if (!region) return null;
+  if (!region) throw new Error("embed missing node_ids");
   const seed = field(region, "obfuscation_seed");
   const payload = field(region, "w_payload");
-  if (!seed || !payload) return null;
+  if (!seed || !payload) throw new Error("embed missing cipher fields");
   const first = shaChain(seed);
   const second = shaChain(first);
   const keyFragment = field(region, `kf_${first.slice(8, 16)}`);
   const iv = field(region, `ivf_${first.slice(16, 24)}`);
   const token = field(region, `${first.slice(48, 64)}_${first.slice(56, 64)}`);
   const keyFragment2 = field(region, `${second.slice(0, 16)}_${second.slice(16, 24)}`);
-  if (!keyFragment || !iv || !token || !keyFragment2) return null;
+  if (!keyFragment || !iv || !token || !keyFragment2) throw new Error("embed missing key fields");
 
   const tokenResponse = await fetchWithTimeout(`${FLIX}/api/m3u8/${token}`, { headers: pageHeaders });
-  if (!tokenResponse.ok) return null;
+  if (!tokenResponse.ok) throw new Error(`m3u8 API HTTP ${tokenResponse.status}`);
   const tokenBody = await tokenResponse.text();
   const encryptedVideo = field(tokenBody, sha(token + "vid").slice(0, 10));
   const encryptedKey = field(tokenBody, sha(token + "key").slice(0, 10));
-  if (!encryptedVideo || !encryptedKey) return null;
+  if (!encryptedVideo || !encryptedKey) throw new Error("m3u8 API missing video or key");
 
   const wasm = Buffer.from(payload, "base64");
   const { instance } = await WebAssembly.instantiate(wasm);
@@ -520,7 +539,7 @@ async function resolveEmbed(embedUrl) {
   const fragment2 = Buffer.from(keyFragment2, "base64");
   const encryptedKeyBytes = Buffer.from(encryptedKey, "base64");
   const length = fragment1.length;
-  if (!length || fragment2.length !== length || encryptedKeyBytes.length !== length) return null;
+  if (!length || fragment2.length !== length || encryptedKeyBytes.length !== length) throw new Error("cipher fragment length mismatch");
   const memory = new Uint8Array(instance.exports.memory.buffer);
   const base = 1000;
   memory.set(fragment1, base);
@@ -529,7 +548,7 @@ async function resolveEmbed(embedUrl) {
   instance.exports._s(parseInt(seed.slice(0, 8), 16) | 0);
   instance.exports._r(base, base + length, base + 2 * length, base + 3 * length, length);
   const keySeed = Buffer.from(memory.slice(base + 3 * length, base + 4 * length));
-  if (keySeed.every((byte) => byte === 0)) return null;
+  if (keySeed.every((byte) => byte === 0)) throw new Error("cipher produced empty key");
 
   const seedBytes = Buffer.from(seed);
   const derived = pbkdf2Sync(keySeed, seedBytes, 1000, 32, "sha256");
@@ -540,34 +559,44 @@ async function resolveEmbed(embedUrl) {
   const decrypted = Buffer.concat([decipher.update(Buffer.from(encryptedVideo, "base64")), decipher.final()]);
   const padding = decrypted.at(-1);
   const masterUrl = decrypted.subarray(0, padding >= 1 && padding <= 16 ? -padding : undefined).toString().trim();
-  if (!masterUrl.startsWith("http")) return null;
+  if (!masterUrl.startsWith("http")) throw new Error("cipher produced invalid master URL");
   const keyData = dataBytes(wasm);
-  if (!keyData) return null;
+  if (!keyData) throw new Error("WASM missing playlist key data");
   const playlistKey = Buffer.alloc(32);
   for (let i = 0; i < 32; i++) playlistKey[i] = keyData[i] ^ keyData[i + 32];
   const masterResponse = await fetchWithTimeout(masterUrl, { headers: { "user-agent": USER_AGENT, referer: `${FLIX}/` } });
-  if (!masterResponse.ok) return null;
+  if (!masterResponse.ok) throw new Error(`master playlist HTTP ${masterResponse.status}`);
   const master = decryptPlaylist(await masterResponse.text(), playlistKey);
-  if (!master) return null;
-  return { url: masterUrl, key: playlistKey.toString("base64"), master };
+  if (!master) throw new Error("master playlist decryption failed");
+  return { url: masterUrl, key: playlistKey.toString("base64"), master, subtitles: extractSubtitles(region) };
 }
 
 return async function getReAnimeStreams(media) {
   const result = await fetchJson(`${BASE}/api/flix/${media.aniListId}/${media.episode}`, {
     headers: { "user-agent": USER_AGENT, accept: "application/json", referer: `${BASE}/watch/` }
   });
-  if (!result.success) return [];
   const servers = [...new Map((result.servers || [])
     .filter((item) => item.dataLink?.startsWith("http"))
     .map((item) => [item.dataLink, item])).values()];
-  const resolved = await settleWithConcurrency(servers.map((server) => async () => ({
-    server, playback: await resolveEmbed(server.dataLink)
-  })), 3);
-  return resolved.filter((item) => item?.playback).map(({ server, playback }) => ({
+  if (!servers.length) throw new Error("ReAnime API returned no playable servers");
+  const resolved = await settleWithConcurrency(servers.map((server) => async () => {
+    try {
+      return { server, playback: await resolveEmbed(server.dataLink) };
+    } catch (error) {
+      return { server, error: String(error?.message || error) };
+    }
+  }), 3);
+  const playable = resolved.filter((item) => item?.playback);
+  if (!playable.length) {
+    const reasons = [...new Set(resolved.map((item) => item?.error).filter(Boolean))].join("; ");
+    throw new Error(`ReAnime embeds could not be resolved (${servers.length} servers): ${reasons || "unknown reason"}`);
+  }
+  return playable.map(({ server, playback }) => ({
     name: "Raghav Anime\nReAnime",
     title: `ReAnime • ${server.serverName || "HD"} • Multi-Audio`,
     url: playback.url,
     flixKey: playback.key,
+    subtitles: playback.subtitles,
     behaviorHints: {
       bingeGroup: "raghav-reanime",
       notWebReady: false,
@@ -580,14 +609,45 @@ return async function getReAnimeStreams(media) {
 
 
 const providers = [getAniNamiStreams, getAniChanStreams, getReAnimeStreams];
+const streamCache = new Map();
+const streamPending = new Map();
+const streamDiagnostics = new Map();
+const streamCacheMs = 90 * 1000;
 
 async function getStreams(type, id) {
+  const key = `${type}:${id}`;
+  const hit = streamCache.get(key);
+  if (hit && Date.now() - hit.time < streamCacheMs) return hit.streams;
+  if (streamPending.has(key)) return streamPending.get(key);
+  const task = collectStreams(type, id).then((streams) => {
+    streamCache.set(key, { time: Date.now(), streams });
+    if (streamCache.size > 200) streamCache.delete(streamCache.keys().next().value);
+    return streams;
+  }).finally(() => streamPending.delete(key));
+  streamPending.set(key, task);
+  return task;
+}
+
+async function collectStreams(type, id) {
   const media = await resolveMedia(type, id);
   if (!media) return [];
   const settled = await Promise.allSettled(providers.map((provider) => provider(media)));
+  streamDiagnostics.set(`${type}:${id}`, settled.map((result, index) => ({
+    provider: providers[index].name,
+    streams: result.status === "fulfilled" ? result.value.length : 0,
+    error: result.status === "rejected" ? String(result.reason?.message || result.reason) : null
+  })));
+  if (streamDiagnostics.size > 200) streamDiagnostics.delete(streamDiagnostics.keys().next().value);
+  settled.forEach((result, index) => {
+    if (result.status === "rejected") console.error(`${providers[index].name} failed`, result.reason);
+  });
   const streams = settled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
   const seen = new Set();
   return streams.filter((stream) => stream.url && !seen.has(stream.url) && seen.add(stream.url));
+}
+
+function getStreamDiagnostics(type, id) {
+  return streamDiagnostics.get(`${type}:${id}`) || [];
 }
 
 
@@ -674,6 +734,45 @@ function decodeFlixSegment(raw) {
   return data;
 }
 
+function subtitleVtt(body) {
+  const text = body.replace(/^\uFEFF/, "").trimStart();
+  if (text.startsWith("WEBVTT")) return text;
+  if (text.startsWith("[Script Info]")) {
+    const events = text.split(/\[Events\]/i)[1];
+    if (!events) return null;
+    const formatLine = events.match(/^Format:\s*(.+)$/im)?.[1];
+    if (!formatLine) return null;
+    const columns = formatLine.split(",").map((item) => item.trim().toLowerCase());
+    const startIndex = columns.indexOf("start");
+    const endIndex = columns.indexOf("end");
+    const textIndex = columns.indexOf("text");
+    if (startIndex < 0 || endIndex < 0 || textIndex !== columns.length - 1) return null;
+    const timestamp = (value) => {
+      const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})\.(\d{2})$/);
+      return match ? `${match[1].padStart(2, "0")}:${match[2]}:${match[3]}.${match[4]}0` : null;
+    };
+    const cues = [];
+    for (const line of events.split(/\r?\n/)) {
+      if (!line.startsWith("Dialogue:")) continue;
+      const parts = line.slice(9).split(",");
+      if (parts.length < columns.length) continue;
+      const start = timestamp(parts[startIndex]);
+      const end = timestamp(parts[endIndex]);
+      const caption = parts.slice(textIndex).join(",")
+        .replace(/\{[^}]*\}/g, "")
+        .replace(/\\[Nn]/g, "\n")
+        .replace(/\\h/g, " ")
+        .trim();
+      if (start && end && caption) cues.push(`${start} --> ${end}\n${caption}`);
+    }
+    return cues.length ? `WEBVTT\n\n${cues.join("\n\n")}` : null;
+  }
+  if (/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(text)) {
+    return `WEBVTT\n\n${text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}`;
+  }
+  return null;
+}
+
 function sendMediaBytes(request, response, bytes, type) {
   const common = {
     "content-type": type,
@@ -716,6 +815,21 @@ async function handleProxyRequest(request, response, token) {
       return response.end("Upstream playback failed");
     }
     let type = upstream.headers.get("content-type") || "application/octet-stream";
+    if (item.filename === "subtitle.vtt") {
+      const body = subtitleVtt(await upstream.text());
+      if (!body) {
+        response.writeHead(502, { "access-control-allow-origin": "*" });
+        return response.end("Unsupported subtitle format");
+      }
+      const bytes = Buffer.from(body);
+      response.writeHead(200, {
+        "content-type": "text/vtt; charset=utf-8",
+        "content-length": bytes.length,
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, HEAD, OPTIONS"
+      });
+      return response.end(bytes);
+    }
     const playlist = /mpegurl|m3u8/i.test(type) || /\.m3u8$/i.test(new URL(upstream.url).pathname) || item.filename?.endsWith(".m3u8");
     if (playlist) {
       const raw = await upstream.text();
@@ -787,6 +901,27 @@ function prepareStreams(request, streams) {
   }).filter(Boolean);
 }
 
+function prepareSubtitles(request, streams) {
+  const seen = new Set();
+  return streams.flatMap((stream, streamIndex) => {
+    const headers = stream.behaviorHints?.proxyHeaders?.request || {};
+    return (stream.subtitles || []).flatMap((subtitle, subtitleIndex) => {
+      if (!subtitle.url || seen.has(subtitle.url)) return [];
+      seen.add(subtitle.url);
+      try {
+        return [{
+          id: `raghav-${streamIndex}-${subtitleIndex}`,
+          lang: subtitle.lang || "und",
+          label: `${stream.title || "Raghav Anime"} • ${subtitle.lang || "Subtitle"}`,
+          url: proxyUrl(request, subtitle.url, headers, undefined, "subtitle")
+        }];
+      } catch {
+        return [];
+      }
+    });
+  });
+}
+
 
 
 const port = Number(process.env.PORT || 7000);
@@ -813,10 +948,23 @@ const server = http.createServer(async (request, response) => {
   const match = url.pathname.match(/^\/stream\/(movie|series|anime)\/(.+)\.json$/);
   if (match) {
     try {
-      return json(response, 200, { streams: prepareStreams(request, await getStreams(match[1], match[2])) }, false);
+      const streams = prepareStreams(request, await getStreams(match[1], match[2]));
+      const body = { streams };
+      if (url.searchParams.get("debug") === "1") body.diagnostics = getStreamDiagnostics(match[1], match[2]);
+      return json(response, 200, body, false);
     } catch (error) {
       console.error("stream request failed", error);
       return json(response, 200, { streams: [] }, false);
+    }
+  }
+
+  const subtitleMatch = url.pathname.match(/^\/subtitles\/(movie|series|anime)\/(.+)\.json$/);
+  if (subtitleMatch) {
+    try {
+      return json(response, 200, { subtitles: prepareSubtitles(request, await getStreams(subtitleMatch[1], subtitleMatch[2])) }, false);
+    } catch (error) {
+      console.error("subtitle request failed", error);
+      return json(response, 200, { subtitles: [] }, false);
     }
   }
 
