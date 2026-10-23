@@ -11,9 +11,9 @@ import { pathToFileURL } from "node:url";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.3",
+  version: "1.3.4",
   name: "Raghav Anime",
-  description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
+  description: "Aggregated SUB and DUB anime streams for Stremio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
   resources: ["stream", "subtitles"],
   types: ["movie", "series", "anime"],
@@ -29,13 +29,10 @@ const manifest = {
 const DEFAULT_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 15000);
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+  // Keep the deadline active while a playlist or video body is being consumed.
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+  return fetch(url, { ...options, signal });
 }
 
 async function fetchJson(url, options = {}, timeoutMs) {
@@ -440,22 +437,12 @@ async function resolveVidhawk(media, audio, server) {
   return play.tracks?.find((track) => String(track.id).toLowerCase() === audio && track.src?.startsWith("http"))?.src || null;
 }
 
-return async function getAniChanStreams(media) {
+return async function getAniChanStreams(media, onStreams = () => {}) {
   const config = await playerConfig(media);
   const requests = ["sub", "dub"].flatMap((audio) => ["fast", "rest"].map((tier) => ({ audio, tier })));
-  const audioResults = await Promise.allSettled(requests.map(async ({ audio, tier }) =>
-    ({ audio, items: await servers(media, audio, tier, config) })));
-  if (audioResults.every((result) => result.status === "rejected")) throw audioResults[0].reason;
   const seen = new Set();
-  const targets = audioResults.filter((result) => result.status === "fulfilled")
-    .flatMap(({ value }) => value.items.map((server) => ({ audio: value.audio, server })))
-    .filter(({ audio, server }) => {
-      const key = `${audio}:${server.name || server.stream || server.embed}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  const resolved = await settleWithConcurrency(targets.map(({ audio, server }) => async () => {
+  const streams = [];
+  async function resolveServer(audio, server) {
       let url = server.stream;
       if (server.type === "embed") {
         const provider = String(server.embed || "").match(/[?&]server=([^&]+)/)?.[1] || "kari";
@@ -482,8 +469,27 @@ return async function getAniChanStreams(media) {
           proxyHeaders: { request: { Referer: `${BASE_URL}/`, "User-Agent": USER_AGENT } }
         }
       };
-  }), 8);
-  return resolved.filter(Boolean);
+  }
+  const audioResults = await Promise.allSettled(requests.map(async ({ audio, tier }) => {
+    const items = await servers(media, audio, tier, config);
+    const targets = items.filter((server) => {
+      const key = `${audio}:${server.name || server.stream || server.embed}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    // Publish direct sources before waiting for slower embed resolvers.
+    for (const embedded of [false, true]) {
+      const resolved = await settleWithConcurrency(targets
+        .filter((server) => (server.type === "embed") === embedded)
+        .map((server) => () => resolveServer(audio, server)), 8);
+      const batch = resolved.filter(Boolean);
+      streams.push(...batch);
+      if (batch.length) onStreams(batch);
+    }
+  }));
+  if (audioResults.every((result) => result.status === "rejected")) throw audioResults[0].reason;
+  return streams;
 }
 
 })();
@@ -706,7 +712,7 @@ return async function getReAnimeStreams(media) {
 })();
 
 
-const providers = [getAniNamiStreams, getAniChanStreams, getReAnimeStreams];
+const providers = [getAniNamiStreams, getAniChanStreams];
 const streamCache = new Map();
 const streamPending = new Map();
 const streamDiagnostics = new Map();
@@ -729,19 +735,43 @@ async function getStreams(type, id) {
 async function collectStreams(type, id) {
   const media = await resolveMedia(type, id);
   if (!media) return [];
-  const settled = await Promise.allSettled(providers.map((provider) => provider(media)));
-  streamDiagnostics.set(`${type}:${id}`, settled.map((result, index) => ({
-    provider: providers[index].name,
-    streams: result.status === "fulfilled" ? result.value.length : 0,
-    error: result.status === "rejected" ? String(result.reason?.message || result.reason) : null
-  })));
-  if (streamDiagnostics.size > 200) streamDiagnostics.delete(streamDiagnostics.keys().next().value);
-  settled.forEach((result, index) => {
-    if (result.status === "rejected") console.error(`${providers[index].name} failed`, result.reason);
-  });
-  const streams = settled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  const streams = [];
   const seen = new Set();
-  return streams.filter((stream) => stream.url && !seen.has(stream.url) && seen.add(stream.url));
+  const started = Date.now();
+  const diagnostics = providers.map((provider) => ({ provider: provider.name, streams: 0, error: null, pending: true }));
+  streamDiagnostics.set(`${type}:${id}`, diagnostics);
+  if (streamDiagnostics.size > 200) streamDiagnostics.delete(streamDiagnostics.keys().next().value);
+  let finish;
+  const ready = new Promise((resolve) => { finish = resolve; });
+  let grace;
+  let pending = providers.length;
+  function publish(index, batch) {
+    for (const stream of batch) {
+      if (!stream.url || seen.has(stream.url)) continue;
+      seen.add(stream.url);
+      streams.push(stream);
+      diagnostics[index].streams++;
+    }
+    // Give the other audio track a short chance to arrive, without making ready
+    // streams wait for every provider, tier and embed to finish.
+    if (streams.length && !grace) grace = setTimeout(() => finish(streams), 350);
+  }
+  for (const [index, provider] of providers.entries()) {
+    Promise.resolve().then(() => provider(media, (batch) => publish(index, batch)))
+      .then((batch) => publish(index, batch))
+      .catch((error) => {
+        diagnostics[index].error = String(error?.message || error);
+        console.error(`${provider.name} failed`, error);
+      }).finally(() => {
+        diagnostics[index].pending = false;
+        diagnostics[index].durationMs = Date.now() - started;
+        if (--pending === 0) {
+          clearTimeout(grace);
+          finish(streams);
+        }
+      });
+  }
+  return ready;
 }
 
 function getStreamDiagnostics(type, id) {
@@ -906,7 +936,7 @@ async function handleProxyRequest(request, response, token) {
   }
   try {
     const headers = { ...item.headers };
-    if (request.headers.range && !item.flixKey && !/^(?:segment\.ts|segment\.m4s)$/.test(item.filename)) headers.range = request.headers.range;
+    if (request.headers.range && !item.flixKey) headers.range = request.headers.range;
     const upstream = await fetchWithTimeout(item.url, { headers }, 25000);
     if (!upstream.ok && upstream.status !== 206) {
       response.writeHead(upstream.status);
@@ -960,8 +990,9 @@ async function handleProxyRequest(request, response, token) {
       const decoded = decodeFlixSegment(Buffer.from(await upstream.arrayBuffer()));
       return sendMediaBytes(request, response, decoded, "video/mp2t");
     }
-    if (type.startsWith("image/jpeg") && /\/seg-[^/]+\.jpg$/i.test(new URL(upstream.url).pathname)) type = "video/mp2t";
-    if (/^(?:segment\.ts|segment\.m4s)$/.test(item.filename)) {
+    if (item.filename === "segment.ts") type = "video/mp2t";
+    if (item.filename === "segment.m4s") type = "video/iso.segment";
+    if (request.headers.range && upstream.status !== 206 && /^(?:segment\.ts|segment\.m4s)$/.test(item.filename)) {
       return sendMediaBytes(request, response, Buffer.from(await upstream.arrayBuffer()), type);
     }
     const forwarded = { "content-type": type, "access-control-allow-origin": "*", "access-control-allow-methods": "GET, HEAD, OPTIONS", "accept-ranges": "bytes" };
@@ -970,7 +1001,11 @@ async function handleProxyRequest(request, response, token) {
       if (value) forwarded[key] = value;
     }
     response.writeHead(upstream.status, forwarded);
-    if (upstream.body) Readable.fromWeb(upstream.body).on("error", () => response.destroy()).pipe(response);
+    if (upstream.body) {
+      const body = Readable.fromWeb(upstream.body);
+      response.on("close", () => body.destroy());
+      body.on("error", () => response.destroy()).pipe(response);
+    }
     else response.end();
   } catch (error) {
     console.error("playback proxy failed", error);
@@ -984,14 +1019,20 @@ function prepareStreams(request, streams) {
     const { flixKey, ...publicStream } = stream;
     const headers = stream.behaviorHints?.proxyHeaders?.request || {};
     try {
+      const playbackUrl = proxyUrl(request, stream.url, headers, undefined, "stream", flixKey);
       return {
         ...publicStream,
-        url: proxyUrl(request, stream.url, headers, undefined, "stream", flixKey),
+        url: playbackUrl,
         subtitles: stream.subtitles?.map((subtitle) => ({
           ...subtitle,
           url: proxyUrl(request, subtitle.url, headers, undefined, "subtitle")
         })),
-        behaviorHints: { ...stream.behaviorHints, notWebReady: false, proxyHeaders: undefined }
+        behaviorHints: {
+          ...stream.behaviorHints,
+          notWebReady: filenameFor(stream.url, "stream") !== "video.mp4" || !playbackUrl.startsWith("https:"),
+          filename: filenameFor(stream.url, "stream"),
+          proxyHeaders: undefined
+        }
       };
     } catch {
       return null;
@@ -1068,7 +1109,7 @@ const server = http.createServer(async (request, response) => {
 
   if (url.pathname === "/") {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    return response.end(`<!doctype html><title>Raghav Anime</title><h1>Raghav Anime</h1><p>Stremio/Nuvio addon is running.</p><p><a href="stremio://${request.headers.host}/manifest.json">Install in Stremio</a></p>`);
+    return response.end(`<!doctype html><title>Raghav Anime</title><h1>Raghav Anime</h1><p>Stremio addon is running.</p><p><a href="stremio://${request.headers.host}/manifest.json">Install in Stremio</a></p>`);
   }
   return json(response, 404, { error: "Not found" });
 });
