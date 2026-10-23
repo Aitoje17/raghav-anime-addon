@@ -2,7 +2,32 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, createHmac } from "node:crypto";
 import { once } from "node:events";
-import { server, getAniChanStreams } from "../server.mjs";
+import { server, getAniChanStreams, rewritePlaylist } from "../server.mjs";
+
+test("AniChan media avoids a second relay while playlists and keys stay proxied", () => {
+  const gateway = "https://c.toroplay.cymru/assets/signed-token/seg-76-f1-v1-a1.webp";
+  const request = { headers: { host: "addon.example", "x-forwarded-proto": "https" } };
+  const originalSetting = process.env.DIRECT_ANICHAN_MEDIA;
+  delete process.env.DIRECT_ANICHAN_MEDIA;
+  try {
+    const playlist = rewritePlaylist([
+      "#EXTM3U", '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"',
+      "#EXTINF:10,", gateway,
+      "https://c.toroplay.cymru/api/watch/m3u8?url=variant",
+      "https://other.example/assets/signed-token/seg-1.jpg"
+    ].join("\n"), "https://c.toroplay.cymru/api/watch/m3u8", request, {}, Date.now() + 60000);
+    assert.ok(playlist.includes("https://c.toroplay.cymru/assets/signed-token/segment.ts"));
+    assert.match(playlist, /#EXT-X-KEY:METHOD=AES-128,URI="https:\/\/addon\.example\/play\//);
+    assert.equal(playlist.split("\n").filter((line) => line.startsWith("https://addon.example/play/")).length, 2);
+    process.env.DIRECT_ANICHAN_MEDIA = "0";
+    assert.match(rewritePlaylist(gateway, gateway, request, {}, Date.now() + 60000), /^https:\/\/addon\.example\/play\//);
+    delete process.env.DIRECT_ANICHAN_MEDIA;
+    assert.match(rewritePlaylist(gateway, gateway, request, {}, Date.now() + 60000, "legacy-key"), /^https:\/\/addon\.example\/play\//);
+  } finally {
+    if (originalSetting === undefined) delete process.env.DIRECT_ANICHAN_MEDIA;
+    else process.env.DIRECT_ANICHAN_MEDIA = originalSetting;
+  }
+});
 
 test("AniChan current API and add-on playback", async (t) => {
   const originalFetch = globalThis.fetch;

@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.6",
+  version: "1.3.7",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -873,7 +873,21 @@ function decode(token) {
 }
 
 function rewritePlaylist(body, upstreamUrl, request, headers, expires, flixKey) {
-  const wrap = (path) => proxyUrl(request, new URL(path, upstreamUrl).href, headers, expires, undefined, flixKey);
+  const wrap = (path) => {
+    const target = new URL(path, upstreamUrl);
+    // AniChan already supplies a signed, CORS-enabled media gateway. Sending
+    // its chunks through Render again adds latency on every seek. Its asset
+    // route permits a cosmetic filename: retain a .ts extension for Stremio's
+    // native HLS demuxer instead of the gateway's disguised .jpg/.js names.
+    if (process.env.DIRECT_ANICHAN_MEDIA !== "0" && !flixKey &&
+        target.protocol === "https:" && target.hostname === "c.toroplay.cymru" &&
+        /^\/assets\/[^/]+\/seg[-_][^/]+$/i.test(target.pathname) &&
+        !/\.(?:m3u8|mp4|m4s|key|bin|vtt|srt)$/i.test(target.pathname)) {
+      target.pathname = target.pathname.replace(/[^/]+$/, "segment.ts");
+      return target.href;
+    }
+    return proxyUrl(request, target.href, headers, expires, undefined, flixKey);
+  };
   return body.split(/\r?\n/).map((line) => {
     if (line.startsWith("#")) {
       return line.replace(/URI="([^"]+)"/g, (_, path) => `URI="${wrap(path)}"`);
@@ -1160,7 +1174,7 @@ const server = http.createServer(async (request, response) => {
   return json(response, 404, { error: "Not found" });
 });
 
-export { server, getAniChanStreams };
+export { server, getAniChanStreams, rewritePlaylist, proxyUrl };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   server.listen(port, "0.0.0.0", () => console.log(`Raghav Anime addon listening on http://0.0.0.0:${port}`));
