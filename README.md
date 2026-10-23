@@ -55,6 +55,19 @@ Successful HTTP responses or offline regression tests alone do not confirm
 playback in a Stremio client. Stremio Web needs a connected Stremio streaming
 server for streams marked `notWebReady`.
 
+## Seeking (1.3.7)
+
+AniChan's signed media gateway already serves video chunks with CORS and byte
+range support. Playlists keep the addon's compatibility handling, while those
+gateway chunks now travel directly to the player, avoiding an extra trip through
+Render on each seek. Cosmetic gateway filenames use `.ts` so Stremio's native
+HLS demuxer can open otherwise disguised media assets. Keys, subtitles, other
+hosts, and encrypted legacy streams keep the existing proxy path.
+
+Set `DIRECT_ANICHAN_MEDIA=0` to use the full proxy path if a client or network
+cannot access the gateway directly. This reduces the addon's contribution to
+seeking delay; upstream response time and the player's buffering still vary.
+
 ## Stream loading fix (1.3.3)
 
 AniChan now requires a watch-page Referer, separate `fast` and `rest` tier requests,
@@ -74,7 +87,7 @@ https://YOUR-HOST/stream/anime/anilist:21:1.json?debug=1
 ```
 
 The response includes provider stream counts and errors. Verify the manifest says
-`1.3.6`, then reopen the episode in Stremio. If the client retains the old
+`1.3.7`, then reopen the episode in Stremio. If the client retains the old
 manifest, remove and reinstall the addon using the same manifest URL.
 
 Run `npm test` for offline regression tests covering encrypted responses, session
