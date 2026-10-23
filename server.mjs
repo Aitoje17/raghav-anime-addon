@@ -7,10 +7,11 @@ import https from "node:https";
 import { createHmac, randomBytes, timingSafeEqual, createHash, createDecipheriv, pbkdf2Sync } from "node:crypto";
 
 import { Readable } from "node:stream";
+import { pathToFileURL } from "node:url";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.2",
+  version: "1.3.3",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio and Nuvio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -351,26 +352,78 @@ const getAniChanStreams = (() => {
 const BASE_URL = process.env.ANICHAN_URL || "https://anichan.to";
 const USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36";
 
-async function watchSession() {
-  const response = await fetchWithTimeout(`${BASE_URL}/api/watch/session`, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json", origin: BASE_URL, "user-agent": USER_AGENT },
-    body: JSON.stringify({ token: "" })
+// Read the public player configuration instead of pinning its rotating key.
+async function playerConfig(media) {
+  const cacheKey = `anichan-player:${BASE_URL}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  const page = await fetchWithTimeout(`${BASE_URL}/anime/${media.aniListId}`, {
+    headers: { "user-agent": USER_AGENT }
   });
-  if (!response.ok) return null;
-  return response.headers.get("set-cookie")?.match(/anichan_ws=([^;]+)/)?.[1] || null;
+  if (!page.ok) throw new Error(`AniChan player HTTP ${page.status}`);
+  const html = await page.text();
+  const scripts = [...new Set([...html.matchAll(/<script[^>]*src="([^"]+)"/g)]
+    .map((match) => new URL(match[1], BASE_URL))
+    .filter((url) => url.origin === new URL(BASE_URL).origin)
+    .map((url) => url.href))];
+  const results = await settleWithConcurrency(scripts.map((url) => async () => {
+    const response = await fetchWithTimeout(url, { headers: { "user-agent": USER_AGENT } });
+    if (!response.ok) return null;
+    const source = await response.text();
+    if (!source.includes("/api/watch/servers")) return null;
+    const match = source.match(/(?:let |,)[\w$]+="([a-f0-9]{8})",[\w$]+="([A-Za-z0-9+/]{43}=)",[\w$]+="([A-Za-z0-9+/]{43}=)"/);
+    if (!match) return null;
+    const first = Buffer.from(match[2], "base64");
+    const second = Buffer.from(match[3], "base64");
+    return { id: match[1], key: Buffer.from(first.map((byte, index) => byte ^ second[index])) };
+  }), 4);
+  const config = results.find(Boolean);
+  if (!config) throw new Error("AniChan player configuration changed or is unavailable");
+  return cacheSet(cacheKey, config);
 }
 
-async function servers(media, audio) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const cookie = await watchSession();
-    if (!cookie) continue;
-    try {
-      return (await fetchJson(
-        `${BASE_URL}/api/watch/servers?anilistId=${media.aniListId}&ep=${media.episode}&category=${audio}`,
-        { headers: { accept: "application/json", cookie: `anichan_ws=${cookie}`, "user-agent": USER_AGENT } }
-      )).servers || [];
-    } catch {}
+function watchHeaders(media) {
+  return { accept: "application/json", origin: BASE_URL,
+    referer: `${BASE_URL}/anime/${media.aniListId}`, "user-agent": USER_AGENT };
+}
+
+async function watchSession(media) {
+  const response = await fetchWithTimeout(`${BASE_URL}/api/watch/session`, {
+    method: "POST",
+    headers: { ...watchHeaders(media), "content-type": "application/json" },
+    body: JSON.stringify({ token: "" })
+  });
+  if (!response.ok) throw new Error(`AniChan session HTTP ${response.status}`);
+  const cookie = response.headers.get("set-cookie")?.match(/anichan_ws=([^;]+)/)?.[1];
+  const session = await response.json();
+  if (!cookie || !session.n) throw new Error("AniChan session missing cookie or nonce");
+  return { cookie, nonce: session.n };
+}
+
+function decodeServers(data, session, config) {
+  if (data.v !== 1) return data;
+  const key = createHmac("sha256", config.key).update(session.nonce).digest();
+  const encrypted = Buffer.from(data.d, "base64");
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(data.i, "base64"));
+  decipher.setAuthTag(encrypted.subarray(-16));
+  return JSON.parse(Buffer.concat([decipher.update(encrypted.subarray(0, -16)), decipher.final()]).toString());
+}
+
+async function servers(media, audio, tier, config) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const session = await watchSession(media);
+    const response = await fetchWithTimeout(
+      `${BASE_URL}/api/watch/servers?anilistId=${media.aniListId}&ep=${media.episode}&category=${audio}&tier=${tier}`,
+      { headers: { ...watchHeaders(media), cookie: `anichan_ws=${session.cookie}`, "X-Wk": config.id } }
+    );
+    if (response.status === 401 && attempt === 0) continue;
+    if (!response.ok) throw new Error(`AniChan servers HTTP ${response.status}`);
+    try { return decodeServers(await response.json(), session, config).servers || []; }
+    catch (error) {
+      cache.delete(`anichan-player:${BASE_URL}`);
+      if (attempt === 1) throw new Error(`AniChan server response could not be decoded: ${error.message}`);
+      config = await playerConfig(media);
+    }
   }
   return [];
 }
@@ -388,8 +441,20 @@ async function resolveVidhawk(media, audio, server) {
 }
 
 return async function getAniChanStreams(media) {
-  const audioResults = await settleWithConcurrency(["sub", "dub"].map((audio) => async () => ({ audio, items: await servers(media, audio) })), 2);
-  const targets = audioResults.filter(Boolean).flatMap((result) => result.items.map((server) => ({ audio: result.audio, server })));
+  const config = await playerConfig(media);
+  const requests = ["sub", "dub"].flatMap((audio) => ["fast", "rest"].map((tier) => ({ audio, tier })));
+  const audioResults = await Promise.allSettled(requests.map(async ({ audio, tier }) =>
+    ({ audio, items: await servers(media, audio, tier, config) })));
+  if (audioResults.every((result) => result.status === "rejected")) throw audioResults[0].reason;
+  const seen = new Set();
+  const targets = audioResults.filter((result) => result.status === "fulfilled")
+    .flatMap(({ value }) => value.items.map((server) => ({ audio: value.audio, server })))
+    .filter(({ audio, server }) => {
+      const key = `${audio}:${server.name || server.stream || server.embed}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   const resolved = await settleWithConcurrency(targets.map(({ audio, server }) => async () => {
       let url = server.stream;
       if (server.type === "embed") {
@@ -400,10 +465,11 @@ return async function getAniChanStreams(media) {
       }
       if (!url?.startsWith("http")) return null;
       const label = String(server.label || server.name || "AniChan").replace("★", "").trim();
-      const subtitles = (server.subtitles || []).filter((sub) => sub.url?.startsWith("http")).map((sub, index) => ({
+      const subtitles = (server.subtitles || []).map((sub) => ({ ...sub, url: sub.url && new URL(sub.url, BASE_URL).href }))
+        .filter((sub) => sub.url?.startsWith("http")).map((sub, index) => ({
         id: `anichan-${index}-${sub.lang || "subtitle"}`,
         url: sub.url,
-        lang: String(sub.lang || "und").slice(0, 3).toLowerCase()
+        lang: ({ english: "eng", japanese: "jpn", spanish: "spa", french: "fra", german: "deu", portuguese: "por" })[String(sub.lang).toLowerCase()] || String(sub.lang || "und").slice(0, 3).toLowerCase()
       }));
       return {
         name: `Raghav Anime\nAniChan ${audio.toUpperCase()}`,
@@ -1007,4 +1073,8 @@ const server = http.createServer(async (request, response) => {
   return json(response, 404, { error: "Not found" });
 });
 
-server.listen(port, "0.0.0.0", () => console.log(`Raghav Anime addon listening on http://0.0.0.0:${port}`));
+export { server, getAniChanStreams };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen(port, "0.0.0.0", () => console.log(`Raghav Anime addon listening on http://0.0.0.0:${port}`));
+}
