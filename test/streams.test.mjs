@@ -123,6 +123,7 @@ test("AniChan current API and add-on playback", async (t) => {
   await t.test("decrypts both tiers and audio tracks, deduplicates sources, resolves subtitles", async () => {
     const streams = await getAniChanStreams({ aniListId: 21, episode: 1 });
     assert.equal(streams.length, 2);
+    assert.equal(sessionCount, 1, "concurrent audio/tier requests share one session");
     assert.deepEqual([...requestedTiers].sort(), ["dub:fast", "dub:rest", "sub:fast", "sub:rest"]);
     assert.match(streams[0].title, /SUB/);
     assert.match(streams[1].title, /DUB/);
@@ -134,7 +135,7 @@ test("AniChan current API and add-on playback", async (t) => {
     brokenTier = true;
     const before = sessionCount;
     assert.equal((await getAniChanStreams({ aniListId: 21, episode: 2 })).length, 2);
-    assert.ok(sessionCount - before >= 5);
+    assert.ok(sessionCount - before >= 1);
     brokenTier = false;
   });
   await t.test("retains support for unencrypted server lists", async () => {
