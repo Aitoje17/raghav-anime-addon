@@ -27,7 +27,7 @@ The manifest is intended for Stremio. It accepts IMDb, Kitsu, AniList, MAL, and 
 
 Providers are fault-isolated; one upstream failure does not fail the stream response.
 
-## Playback and response speed (1.3.5)
+## Playback and response speed (1.3.6)
 
 HLS streams set `behaviorHints.notWebReady: true` as required by the
 [Stremio stream specification](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/responses/stream.md).
@@ -39,6 +39,8 @@ Once both SUB and DUB sources are ready, streams are returned after a short
 additional seconds so Stremio's single response does not silently omit it.
 Slower tiers, embed resolvers, and providers continue filling the episode cache
 in the background. Debug responses expose `pending` and `durationMs` for each provider.
+Concurrent audio/tier requests share one source session, matching AniChan's
+player and avoiding competing session creation during SUB/DUB lookups.
 Video segments are forwarded as they arrive, with video MIME types and upstream
 range support; upstream deadlines cover response bodies as well as headers.
 
@@ -72,7 +74,7 @@ https://YOUR-HOST/stream/anime/anilist:21:1.json?debug=1
 ```
 
 The response includes provider stream counts and errors. Verify the manifest says
-`1.3.5`, then reopen the episode in Stremio. If the client retains the old
+`1.3.6`, then reopen the episode in Stremio. If the client retains the old
 manifest, remove and reinstall the addon using the same manifest URL.
 
 Run `npm test` for offline regression tests covering encrypted responses, session

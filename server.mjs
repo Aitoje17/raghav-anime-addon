@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.5",
+  version: "1.3.6",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -394,7 +394,10 @@ function watchHeaders(media) {
     referer: `${BASE_URL}/anime/${media.aniListId}`, "user-agent": USER_AGENT };
 }
 
-async function watchSession(media) {
+let activeSession;
+let sessionPending;
+
+async function createWatchSession(media) {
   const response = await fetchWithTimeout(`${BASE_URL}/api/watch/session`, {
     method: "POST",
     headers: { ...watchHeaders(media), "content-type": "application/json" },
@@ -404,7 +407,22 @@ async function watchSession(media) {
   const cookie = response.headers.get("set-cookie")?.match(/anichan_ws=([^;]+)/)?.[1];
   const session = await response.json();
   if (!cookie || !session.n) throw new Error("AniChan session missing cookie or nonce");
-  return { cookie, nonce: session.n };
+  const expires = Number(session.exp) * 1000 || Date.now() + 60 * 60 * 1000;
+  return { cookie, nonce: session.n, expires };
+}
+
+function watchSession(media, refresh = false) {
+  if (refresh) activeSession = null;
+  if (activeSession && activeSession.expires > Date.now() + 60000) return Promise.resolve(activeSession);
+  // Like the source site's player, reuse one session for audio/tier requests
+  // instead of exhausting the upstream's session-creation rate limit.
+  if (!sessionPending) {
+    sessionPending = createWatchSession(media).then((session) => {
+      activeSession = session;
+      return session;
+    }).finally(() => { sessionPending = null; });
+  }
+  return sessionPending;
 }
 
 function decodeServers(data, session, config) {
@@ -418,7 +436,7 @@ function decodeServers(data, session, config) {
 
 async function servers(media, audio, tier, config) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const session = await watchSession(media);
+    const session = await watchSession(media, attempt > 0);
     const response = await fetchWithTimeout(
       `${BASE_URL}/api/watch/servers?anilistId=${media.aniListId}&ep=${media.episode}&category=${audio}&tier=${tier}`,
       { headers: { ...watchHeaders(media), cookie: `anichan_ws=${session.cookie}`, "X-Wk": config.id } }
