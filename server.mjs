@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 
 const manifest = {
   id: "community.raghav.anime",
-  version: "1.3.4",
+  version: "1.3.5",
   name: "Raghav Anime",
   description: "Aggregated SUB and DUB anime streams for Stremio",
   logo: "https://www.pngall.com/wp-content/uploads/13/Anime-Logo-PNG-Images.png",
@@ -28,7 +28,17 @@ const manifest = {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 15000);
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS, headersOnly = false) {
+  if (headersOnly) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+      return await fetch(url, { ...options, signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   // Keep the deadline active while a playlist or video body is being consumed.
   const timeout = AbortSignal.timeout(timeoutMs);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
@@ -744,7 +754,25 @@ async function collectStreams(type, id) {
   let finish;
   const ready = new Promise((resolve) => { finish = resolve; });
   let grace;
+  let audioDeadline;
   let pending = providers.length;
+  function complete() {
+    clearTimeout(grace);
+    clearTimeout(audioDeadline);
+    finish(streams);
+  }
+  function scheduleReady() {
+    if (!streams.length) return;
+    const aniChanPending = diagnostics.find((item) => item.provider === "getAniChanStreams")?.pending;
+    const hasSub = streams.some((stream) => /\bSUB\b/.test(stream.title));
+    const hasDub = streams.some((stream) => /\bDUB\b/.test(stream.title));
+    // A Stremio response is a single list: late audio tracks cannot be inserted
+    // into a list the client has already displayed. Allow slow SUB/DUB lookup
+    // to finish, while still avoiding unrelated provider and embed delays.
+    if ((hasSub && hasDub) || !aniChanPending) {
+      if (!grace) grace = setTimeout(complete, 350);
+    } else if (!audioDeadline) audioDeadline = setTimeout(complete, 8000);
+  }
   function publish(index, batch) {
     for (const stream of batch) {
       if (!stream.url || seen.has(stream.url)) continue;
@@ -752,9 +780,7 @@ async function collectStreams(type, id) {
       streams.push(stream);
       diagnostics[index].streams++;
     }
-    // Give the other audio track a short chance to arrive, without making ready
-    // streams wait for every provider, tier and embed to finish.
-    if (streams.length && !grace) grace = setTimeout(() => finish(streams), 350);
+    scheduleReady();
   }
   for (const [index, provider] of providers.entries()) {
     Promise.resolve().then(() => provider(media, (batch) => publish(index, batch)))
@@ -765,9 +791,9 @@ async function collectStreams(type, id) {
       }).finally(() => {
         diagnostics[index].pending = false;
         diagnostics[index].durationMs = Date.now() - started;
+        scheduleReady();
         if (--pending === 0) {
-          clearTimeout(grace);
-          finish(streams);
+          complete();
         }
       });
   }
@@ -937,7 +963,9 @@ async function handleProxyRequest(request, response, token) {
   try {
     const headers = { ...item.headers };
     if (request.headers.range && !item.flixKey) headers.range = request.headers.range;
-    const upstream = await fetchWithTimeout(item.url, { headers }, 25000);
+    // A complete MP4 is long-lived: its connection deadline covers headers,
+    // while finite HLS playlists/segments keep the body deadline as well.
+    const upstream = await fetchWithTimeout(item.url, { headers }, 25000, item.filename === "video.mp4");
     if (!upstream.ok && upstream.status !== 206) {
       response.writeHead(upstream.status);
       return response.end("Upstream playback failed");

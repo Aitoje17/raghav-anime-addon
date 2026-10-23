@@ -19,6 +19,8 @@ test("AniChan current API and add-on playback", async (t) => {
   let plainResponse = false;
   let holdAniNami;
   let holdRest;
+  let holdSub;
+  let subLookupStarted;
   let streamingSegment = false;
   let finishSegment;
   const requestedTiers = new Set();
@@ -66,6 +68,10 @@ test("AniChan current API and add-on playback", async (t) => {
         const audio = url.searchParams.get("category");
         assert.ok(["fast", "rest"].includes(tier));
         requestedTiers.add(`${audio}:${tier}`);
+        if (audio === "sub" && holdSub) {
+          subLookupStarted?.();
+          await holdSub;
+        }
         if (tier === "rest" && holdRest) await holdRest;
         if (unauthorized) {
           unauthorized = false;
@@ -198,6 +204,33 @@ test("AniChan current API and add-on playback", async (t) => {
       holdAniNami = undefined;
       holdRest = undefined;
       await new Promise((resolve) => setImmediate(resolve));
+    }
+  });
+  await t.test("does not omit SUB when its lookup finishes after DUB", async () => {
+    let releaseSub;
+    let confirmSubStarted;
+    const started = new Promise((resolve) => { confirmSubStarted = resolve; });
+    holdSub = new Promise((resolve) => { releaseSub = resolve; });
+    subLookupStarted = confirmSubStarted;
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`;
+      let completed = false;
+      const response = originalFetch(`${base}/stream/anime/anilist:21:7.json?debug=1`, {
+        signal: AbortSignal.timeout(2500)
+      }).then((response) => { completed = true; return response.json(); });
+      await started;
+      // Deliberately outlast the former 350 ms window using an independently
+      // controlled upstream response, then verify the client receives both.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.equal(completed, false);
+      releaseSub();
+      const result = await response;
+      assert.ok(result.streams.some((stream) => /\bSUB\b/.test(stream.title)));
+      assert.ok(result.streams.some((stream) => /\bDUB\b/.test(stream.title)));
+    } finally {
+      releaseSub();
+      holdSub = undefined;
+      subLookupStarted = undefined;
     }
   });
 });
