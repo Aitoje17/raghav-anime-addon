@@ -17,6 +17,10 @@ test("AniChan current API and add-on playback", async (t) => {
   let brokenAll = false;
   let corruptResponse = false;
   let plainResponse = false;
+  let holdAniNami;
+  let holdRest;
+  let streamingSegment = false;
+  let finishSegment;
   const requestedTiers = new Set();
   const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), {
     status, headers: { "content-type": "application/json", ...headers }
@@ -62,6 +66,7 @@ test("AniChan current API and add-on playback", async (t) => {
         const audio = url.searchParams.get("category");
         assert.ok(["fast", "rest"].includes(tier));
         requestedTiers.add(`${audio}:${tier}`);
+        if (tier === "rest" && holdRest) await holdRest;
         if (unauthorized) {
           unauthorized = false;
           return json({ detail: "session" }, 401);
@@ -78,12 +83,25 @@ test("AniChan current API and add-on playback", async (t) => {
       if (url.pathname === "/media/episode.m3u8") {
         return playlist('#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="/media/key.bin"\n#EXTINF:4,\n/media/segment.ts\n');
       }
-      if (url.pathname === "/media/segment.ts") return new Response(Buffer.from([0x47, 1, 2, 3]));
+      if (url.pathname === "/media/segment.ts") {
+        if (streamingSegment) return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(Buffer.from([0x47, 1]));
+            finishSegment = () => {
+              controller.enqueue(Buffer.from([2, 3]));
+              controller.close();
+            };
+          }
+        }), { headers: { "content-type": "image/jpeg" } });
+        return new Response(Buffer.from([0x47, 1, 2, 3]));
+      }
       if (url.pathname === "/captions.vtt") return new Response("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
     }
-    // Reproduce the other two providers being unavailable on the deployed host.
-    if (url.hostname === "www.aninami.site") return json({}, 404);
-    if (url.hostname === "reanime.to") return json({}, 503);
+    if (url.hostname === "www.aninami.site") {
+      if (holdAniNami) await holdAniNami;
+      return json({}, 404);
+    }
+    if (url.hostname === "reanime.to") assert.fail("ReAnime must not be queried");
     throw new Error(`Unexpected upstream request: ${url}`);
   };
   globalThis.fetch = async (input, options) => {
@@ -132,6 +150,9 @@ test("AniChan current API and add-on playback", async (t) => {
     const base = `http://127.0.0.1:${server.address().port}`;
     const result = await (await originalFetch(`${base}/stream/anime/anilist:21:5.json?debug=1`)).json();
     assert.equal(result.streams.length, 2);
+    // Stremio's published contract requires this for non-MP4 URLs.
+    assert.equal(result.streams[0].behaviorHints.notWebReady, true);
+    assert.equal(result.streams[0].behaviorHints.filename, "master.m3u8");
     assert.equal(result.diagnostics.find((item) => item.provider === "getAniChanStreams").streams, 2);
     const playlist = await (await originalFetch(result.streams[0].url)).text();
     const childUrl = playlist.split("\n").find((line) => line.startsWith(base));
@@ -141,8 +162,42 @@ test("AniChan current API and add-on playback", async (t) => {
     const segmentUrl = child.split("\n").find((line) => line.startsWith(base));
     const segment = await originalFetch(segmentUrl);
     assert.equal(segment.status, 200);
+    assert.equal(segment.headers.get("content-type"), "video/mp2t");
     assert.deepEqual(Buffer.from(await segment.arrayBuffer()), Buffer.from([0x47, 1, 2, 3]));
     const subtitles = await (await originalFetch(result.streams[0].subtitles[0].url)).text();
     assert.match(subtitles, /^WEBVTT/);
+
+    streamingSegment = true;
+    try {
+      const streamed = await originalFetch(segmentUrl, { signal: AbortSignal.timeout(1500) });
+      assert.equal(streamed.headers.get("content-type"), "video/mp2t");
+      const reader = streamed.body.getReader();
+      assert.deepEqual(Buffer.from((await reader.read()).value), Buffer.from([0x47, 1]));
+      finishSegment();
+      assert.deepEqual(Buffer.from((await reader.read()).value), Buffer.from([2, 3]));
+    } finally {
+      streamingSegment = false;
+    }
+  });
+  await t.test("returns available streams while unrelated providers and tiers are still waiting", async () => {
+    let releaseAniNami;
+    let releaseRest;
+    holdAniNami = new Promise((resolve) => { releaseAniNami = resolve; });
+    holdRest = new Promise((resolve) => { releaseRest = resolve; });
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const result = await (await originalFetch(`${base}/stream/anime/anilist:21:6.json?debug=1`, {
+        signal: AbortSignal.timeout(1500)
+      })).json();
+      assert.equal(result.streams.length, 2);
+      assert.ok(result.diagnostics.every((provider) => provider.pending));
+      assert.equal(result.diagnostics.some((provider) => /ReAnime/.test(provider.provider)), false);
+    } finally {
+      releaseAniNami();
+      releaseRest();
+      holdAniNami = undefined;
+      holdRest = undefined;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   });
 });
